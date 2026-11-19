@@ -202,39 +202,42 @@ def evaluate_dfr_fairness_deterministic(worker_id, rules=None):
 
 def run_dfr_demo():
     init_dfr_tables()
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    worker = "[Worker_002]"
 
-    cursor.execute("""
-        SELECT id FROM union_actions WHERE worker_id = ? ORDER BY id DESC LIMIT 1
-    """, ("[Worker_001]",))
-    row = cursor.fetchone()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+
+    row = cur.execute(
+        "SELECT id FROM union_actions WHERE worker_id = ? ORDER BY id DESC LIMIT 1",
+        (worker,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise SystemExit(f"No union_actions row found for {worker}. Run union_action_validator.py first.")
+
+    ua_id = row[0]
+    cur.execute("DELETE FROM dfr_action_metrics WHERE union_action_id = ? AND worker_id = ?", (ua_id, worker))
+    cur.execute("DELETE FROM dfr_fairness_results WHERE worker_id = ?", (worker,))
+    conn.commit()
     conn.close()
 
-    if row:
-        ua_id = row[0]
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM dfr_action_metrics WHERE union_action_id = ?", (ua_id,))
-        cur.execute("DELETE FROM dfr_fairness_results WHERE worker_id = ?", ("[Worker_001]",))
-        conn.commit()
-        conn.close()
+    record_dfr_metrics(
+        union_action_id=ua_id,
+        worker_id=worker,
+        is_dismissal_related=1,
+        worker_requested_review=1,
+        grievance_filed=0,
+        written_rationale_provided=0,
+        evidence_reviewed=0,
+    )
 
-        record_dfr_metrics(
-            union_action_id=ua_id,
-            worker_id="[Worker_001]",
-            is_dismissal_related=1,
-            worker_requested_review=1,
-            grievance_filed=0,
-            written_rationale_provided=0,
-            evidence_reviewed=0,
-        )
-
-    results = evaluate_dfr_fairness_deterministic("[Worker_001]")
-    print(f"[+] Deterministic DFR evaluation complete. Findings: {len(results)}\n")
-    for rule_id, verdict, sev, reason in results:
-        print(f"  [{sev}] {rule_id} -> {verdict}")
-        print(f"    {reason}\n")
+    results = evaluate_dfr_fairness_deterministic(worker)
+    print(f"[+] DFR evaluation complete for {worker} (union_action_id={ua_id}). Findings: {len(results)}")
+    for r in results:
+        if isinstance(r, dict):
+            print(f"  - [{r.get('verdict_status')} / {r.get('severity')}] {r.get('dfr_rule_id')}: {r.get('deterministic_reason')}")
+        else:
+            print(f"  - {r}")
 
 
 if __name__ == "__main__":

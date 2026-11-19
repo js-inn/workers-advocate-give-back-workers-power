@@ -139,27 +139,32 @@ def validate_union_actions(worker_id, max_response_days=14):
 
 def run_union_demo():
     init_union_validation_tables()
+    worker = "[Worker_002]"
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM union_actions WHERE worker_id = ?", ("[Worker_001]",))
-    cursor.execute("DELETE FROM union_validation_flags WHERE worker_id = ?", ("[Worker_001]",))
+    cursor.execute("DELETE FROM union_actions WHERE worker_id = ?", (worker,))
+    cursor.execute("DELETE FROM union_validation_flags WHERE worker_id = ?", (worker,))
     conn.commit()
     conn.close()
 
-    worker = "[Worker_001]"
-    log_union_action(
+    action_id = log_union_action(
         worker_id=worker,
-        union_body="[Union_Local_Example]",
-        related_action_ref="DISMISSAL-2026-03-01",
+        union_body="[Union_Local_A]",
+        related_action_ref="DISMISSAL_2026_03_01",
         action_status="DELAYED",
         days_elapsed=21,
-        notes="Initial grievance review and escalation pending despite prior unresolved harassment complaints."
+        notes="Sanitized union response log; delayed follow-up past initial window",
     )
+    print(f"[+] Logged union action #{action_id} for {worker}")
 
     flags = validate_union_actions(worker, max_response_days=14)
-    print(f"\n[+] Union validation complete for {worker}. Flags raised: {len(flags)}\n")
-    for code, sev, text in flags:
-        print(f"  [{sev}] {code}: {text}")
+    print(f"[+] Validation complete for {worker}. Flags raised: {len(flags)}")
+    for idx, flag in enumerate(flags, 1):
+        if isinstance(flag, dict):
+            print(f"  Flag {idx} [{flag.get('severity')}] - {flag.get('validation_code')}: {flag.get('finding')}")
+        else:
+            print(f"  Flag {idx}: {flag}")
 
 
 if __name__ == "__main__":

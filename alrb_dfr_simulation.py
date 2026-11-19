@@ -166,6 +166,17 @@ def main():
             "board_reviewed_procedural_conduct": 1,
             "board_addressed_key_evidence": 1,
         },
+        {
+            # 4 general baseline flags set to 1; remaining flags left at 0 for testing
+            "scenario_name": "Case_C_Four_Flag_General_Baseline",
+            "union_investigated_facts": 1,           # Flag 1 (General baseline: Yes)
+            "union_considered_merits_fairly": 1,     # Flag 2 (General baseline: Yes)
+            "union_free_of_bad_faith_or_bias": 1,    # Flag 3 (General baseline: Yes)
+            "union_communicated_timely": 1,          # Flag 4 (General baseline: Yes)
+            "worker_cooperated_and_timely": 0,       # Test toggle (0 = No, 1 = Yes)
+            "board_reviewed_procedural_conduct": 0,  # Test toggle (0 = No, 1 = Yes)
+            "board_addressed_key_evidence": 0,       # Test toggle (0 = No, 1 = Yes)
+        },
     ]
 
     for case in test_cases:

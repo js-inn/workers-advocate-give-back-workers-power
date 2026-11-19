@@ -119,4 +119,10 @@ def export_bundle_to_file(worker_id, output_filename="workers_advocate_audit_bun
 
 
 if __name__ == "__main__":
-    export_bundle_to_file("[Worker_001]")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Export combined Workers Advocate audit bundle.")
+    parser.add_argument("--worker-id", default="[Worker_002]", help="Worker token to filter by (default: [Worker_002])")
+    parser.add_argument("--output", default="workers_advocate_audit_bundle.json", help="Output JSON filename")
+    args = parser.parse_args()
+    export_bundle_to_file(args.worker_id, args.output)

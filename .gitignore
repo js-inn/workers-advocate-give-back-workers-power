@@ -2,3 +2,15 @@
 # Local SQLite databases and exported audit JSON reports
 *.db
 *.json
+
+# SQLite databases & journals
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Python & Termux artifacts
+__pycache__/
+*.py[cod]
+.DS_Store

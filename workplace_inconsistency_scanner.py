@@ -211,50 +211,86 @@ def export_compliance_report(worker_id, output_path="audit_compliance_report.jso
 
 def run_sanitized_demo():
     init_inconsistency_db()
+    worker = "[Worker_002]"
+
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute("DELETE FROM worker_complaints")
-    cursor.execute("DELETE FROM disciplinary_actions")
-    cursor.execute("DELETE FROM hardship_and_requests")
-    cursor.execute("DELETE FROM inconsistency_flags")
+    # Clear prior rows for this worker so re-running stays clean
+    cur.execute("DELETE FROM inconsistency_flags WHERE worker_id = ?", (worker,))
+    cur.execute("DELETE FROM worker_complaints WHERE worker_id = ?", (worker,))
+    cur.execute("DELETE FROM hardship_and_requests WHERE worker_id = ?", (worker,))
+    cur.execute("DELETE FROM disciplinary_actions WHERE worker_id = ?", (worker,))
 
-    worker = "[Worker_001]"
-
-    cursor.execute("""
+    # 1. Worker complaints (filed_at, worker_id, complaint_category, summary, status, resolved_at)
+    cur.executemany(
+        """
         INSERT INTO worker_complaints (filed_at, worker_id, complaint_category, summary, status, resolved_at)
-        VALUES
-        ('2026-01-10T09:00:00+00:00', ?, 'Workplace Harassment', 'First formal harassment complaint submitted to administrator', 'UNRESOLVED', NULL),
-        ('2026-02-04T14:30:00+00:00', ?, 'Workplace Harassment', 'Second formal harassment complaint submitted; no resolution provided', 'UNRESOLVED', NULL)
-    """, (worker, worker))
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("2026-01-10", worker, "Workplace Harassment", "First sanitized complaint logged; unresolved", "UNRESOLVED", None),
+        ],
+    )
 
-    cursor.execute("""
+    # 2. Hardship & requests (recorded_at, worker_id, event_type, description, request_status)
+    cur.executemany(
+        """
         INSERT INTO hardship_and_requests (recorded_at, worker_id, event_type, description, request_status)
-        VALUES
-        ('2026-02-12T08:00:00+00:00', ?, 'SECURITY_DISRUPTION', 'Damaged/broken entry door following unlawful police entry; replacement application refused', 'REFUSED')
-    """, (worker,))
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            ("2026-02-12", worker, "SECURITY_DISRUPTION", "Sanitized external security/housing disruption; request refused", "REFUSED"),
+        ],
+    )
 
-    cursor.execute("""
+    # 3. Disciplinary actions
+    cur.executemany(
+        """
         INSERT INTO disciplinary_actions (
             action_date, worker_id, action_type, cited_infraction,
             workplace_baseline_frequency, peers_disciplined_for_same,
             observed_at, notified_worker_at, notified_at_moment_observed
         )
-        VALUES
-        ('2026-02-15T16:00:00+00:00', ?, 'DISCIPLINARY_NOTICE', 'Forgot to return workplace key at end of shift', 'COMMON_DAILY', 0, '2026-02-15T15:55:00+00:00', '2026-02-15T16:00:00+00:00', 1),
-        ('2026-02-20T11:00:00+00:00', ?, 'WARNING', 'Observed not wearing PPE', 'OCCASIONAL', 0, '2026-02-18T10:15:00+00:00', '2026-02-20T11:00:00+00:00', 0),
-        ('2026-03-01T15:00:00+00:00', ?, 'DISMISSAL', 'Repeated lateness and cumulative workplace infractions', 'RARE', 0, '2026-03-01T15:00:00+00:00', '2026-03-01T15:00:00+00:00', 1)
-    """, (worker, worker, worker))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "2026-03-01",
+                worker,
+                "DISMISSAL",
+                "Cited attendance and cumulative workplace infractions",
+                "COMMON_DAILY",
+                0,
+                "2026-03-01T09:00:00+00:00",
+                "2026-03-01T09:00:00+00:00",
+                1,
+            ),
+        ],
+    )
 
     conn.commit()
     conn.close()
 
-    detected = scan_worker_case(worker)
-    print(f"[+] Scan complete for {worker}. Total Inconsistencies Flagged: {len(detected)}\n")
-    for idx, (rule_id, severity, text) in enumerate(detected, 1):
-        print(f"Flag {idx} [{severity}] - {rule_id}:")
-        print(f"  {text}\n")
-    export_compliance_report(worker)
+    flags = scan_worker_case(worker)
+    print(f"[+] Scan complete for {worker}. Total Inconsistencies Flagged: {len(flags)}\n")
+    for idx, f in enumerate(flags, 1):
+        if isinstance(f, dict):
+            sev = f.get("severity", "UNKNOWN")
+            rule = f.get("rule_id", "UNKNOWN")
+            desc = f.get("finding", "")
+        else:
+            # Handle tuple shapes safely: (rule_id, severity, finding, ...) or table row tuples
+            if len(f) >= 6 and str(f[3]).startswith("RULE_"):
+                rule, sev, desc = f[3], f[4], f[5]
+            elif len(f) >= 3:
+                rule, sev, desc = f[0], f[1], f[2]
+            else:
+                rule, sev, desc = "UNKNOWN", "UNKNOWN", str(f)
+        print(f"Flag {idx} [{sev}] - {rule}:")
+        print(f"  {desc}\n")
+
+    export_compliance_report(worker, "audit_compliance_report.json")
 
 
 if __name__ == "__main__":

@@ -440,11 +440,117 @@ def _attach_export_bundle() -> None:
 _attach_export_bundle()
 
 
+
+def _attach_iso12207_check() -> None:
+    def _reconcile_bucket_deltas(events: List[Dict[str, Any]]) -> Dict[str, int]:
+        sums: Dict[str, int] = {}
+        seen_keys = set()
+        for ev in events:
+            bcode = ev.get("bucket_code")
+            if not bcode:
+                continue
+            rule = ev.get("rule_code") or ""
+            delta = int(ev.get("delta_cents") or 0)
+            try:
+                payload = json.loads(ev.get("payload_json") or "{}")
+            except Exception:
+                payload = {}
+
+            if rule == "DUES_01_ATOMIC_SPLIT":
+                key = ("dues", int(ev["event_id"]), bcode, delta)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    sums[bcode] = sums.get(bcode, 0) + delta
+            elif rule == "LOAN_02_LIQUIDITY_AND_CAP" and payload.get("reason") == "Disbursement":
+                key = ("disburse", payload.get("ref_id"), bcode, delta)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    sums[bcode] = sums.get(bcode, 0) + delta
+            elif rule == "LOAN_04_POOL_REPLENISHMENT" and ("applied_cents" in payload or payload.get("reason") == "Repay"):
+                amt = int(payload["applied_cents"]) if "applied_cents" in payload else abs(delta)
+                ref = payload.get("ref_id") or ev.get("entity_id")
+                key = ("repay", ref, bcode, amt, int(ev["event_id"]) // 2)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    sums[bcode] = sums.get(bcode, 0) + amt
+            elif rule == "LOAN_07_RESERVE_WRITE_OFF" and "absorbed_cents" in payload:
+                amt = abs(int(payload["absorbed_cents"]))
+                key = ("writeoff", ev.get("entity_id"), bcode, amt)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    sums[bcode] = sums.get(bcode, 0) + (-amt)
+        return sums
+
+    def verify_iso12207_compliance(self: CoopBankLedger, bundle_path: Optional[str] = None) -> Dict[str, Any]:
+        chain_ok, _ = self.verify_chain()
+        buckets = [dict(r) for r in self.conn.execute("SELECT * FROM buckets ORDER BY bucket_code").fetchall()]
+        events = [dict(r) for r in self.conn.execute("SELECT * FROM ledger_events ORDER BY event_id ASC").fetchall()]
+
+        event_sums = _reconcile_bucket_deltas(events)
+        missing_trace_events: List[int] = [
+            int(ev["event_id"])
+            for ev in events
+            if not ev.get("rule_code") or not ev.get("entity_type") or not ev.get("entity_id") or not ev.get("occurred_at")
+        ]
+        bucket_mismatches = [
+            bk["bucket_code"]
+            for bk in buckets
+            if int(bk["balance_cents"]) != event_sums.get(bk["bucket_code"], 0)
+        ]
+
+        expected_shares = {
+            "BUCKET_LENDING_POOL": 0.55,
+            "BUCKET_LEGAL_DEFENSE": 0.25,
+            "BUCKET_HARDSHIP_RESERVE": 0.20,
+        }
+        share_mismatches = [
+            bk["bucket_code"]
+            for bk in buckets
+            if abs(float(bk["target_share"]) - expected_shares.get(bk["bucket_code"], -1.0)) > 1e-9
+        ]
+
+        bundle_ok = None
+        if bundle_path:
+            with open(bundle_path, encoding="utf-8") as fh:
+                b = json.load(fh)
+            stored = b.get("bundle_sha256")
+            body = {k: v for k, v in b.items() if k != "bundle_sha256"}
+            recomputed = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+            bundle_ok = (stored == recomputed)
+
+        checks = {
+            "iso12207_configuration_chain_integrity": bool(chain_ok),
+            "iso12207_ledger_bucket_reconciliation": len(bucket_mismatches) == 0,
+            "iso12207_governance_bucket_shares": len(share_mismatches) == 0,
+            "iso12207_audit_event_traceability": len(missing_trace_events) == 0,
+        }
+        if bundle_ok is not None:
+            checks["iso12207_export_bundle_digest"] = bool(bundle_ok)
+
+        return {
+            "standard": "ISO/IEC 12207",
+            "compliant": all(checks.values()),
+            "checks": checks,
+            "event_count": len(events),
+            "reconciled_bucket_sums": event_sums,
+            "bucket_mismatches": bucket_mismatches,
+            "share_mismatches": share_mismatches,
+            "missing_trace_events": missing_trace_events,
+            "bundle_path": bundle_path,
+        }
+
+    CoopBankLedger.verify_iso12207_compliance = verify_iso12207_compliance
+
+
+_attach_iso12207_check()
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["reject", "cap"], default="cap")
     p.add_argument("--test", choices=["all", "stress", "tamper"], default="all")
     p.add_argument("--export-bundle", default=None, help="Write SHA-256 verified JSON audit bundle to path")
+    p.add_argument("--check-iso12207", action="store_true", help="Include ISO/IEC 12207 compliance check in output")
     args = p.parse_args()
     out: Dict[str, Any] = {"mode": args.mode, "test": args.test}
     if args.test in ("all", "tamper"):
@@ -479,6 +585,8 @@ def main() -> None:
         }
         if args.export_bundle:
             out["audit_bundle"] = db.export_audit_bundle(args.export_bundle)
+        if getattr(args, "check_iso12207", False):
+            out["iso12207_compliance"] = db.verify_iso12207_compliance(args.export_bundle)
     print(json.dumps(out, indent=2))
 
 

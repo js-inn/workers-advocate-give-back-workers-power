@@ -151,7 +151,7 @@ def evaluate_dfr_fairness_deterministic(worker_id, rules=None):
                 f"with grievance_filed=0, is_dismissal={bool(is_dismissal)}, and high_or_crit_flags={high_or_crit_flags}."
             ))
 
-        if status_u in ("DELAYED", "NO_RESPONSE", "REFUSED_ESCALATION") and (not rationale or not reviewed):
+        if status_u in ("DELAYED", "NO_RESPONSE", "REFUSED_ESCALATION", "DISMISSED") and (not rationale or not reviewed):
             triggered_rules.append((
                 "DFR_02_UNEXPLAINED_OR_UNREVIEWED_STALL",
                 "HIGH",

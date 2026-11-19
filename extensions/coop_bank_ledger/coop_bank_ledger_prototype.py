@@ -1484,6 +1484,180 @@ def _attach_mortgage_strike_deferral_rule() -> None:
         return report
     CoopBankLedger.audit_ledger_as_member = audit_ledger_as_member
 
+    def file_membership_grievance(
+        self: CoopBankLedger,
+        grievance_id: str,
+        member_token: str,
+        category: str,
+        summary: str,
+        identified_witnesses: int = 0,
+        verified_witnesses: int = 0,
+        member_rebuttal_recorded: bool = True,
+        defense_reconciled: bool = True,
+    ) -> Dict[str, Any]:
+        assert member_token.startswith("[Member_"), f"Invalid member token: {member_token}"
+        if not grievance_id.strip():
+            raise ValueError("grievance_id must be non-empty")
+        if not category.strip():
+            raise ValueError("category must be non-empty")
+        if not summary.strip():
+            raise ValueError("summary must be non-empty")
+        if identified_witnesses < 0 or verified_witnesses < 0:
+            raise ValueError("Witness counts must be non-negative")
+        if verified_witnesses > identified_witnesses:
+            raise ValueError("verified_witnesses cannot exceed identified_witnesses")
+
+        retiree_table = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='retiree_members'"
+        ).fetchone()
+        is_retired = False
+        if retiree_table:
+            r_row = self.conn.execute(
+                "SELECT status FROM retiree_members WHERE member_token = ?",
+                (member_token,),
+            ).fetchone()
+            is_retired = bool(r_row and r_row["status"] == "MEMBER_RETIRED")
+
+        member_standing = "MEMBER_RETIRED" if is_retired else "ACTIVE"
+
+        evidence_eval: Dict[str, Any] | None = None
+        if hasattr(self, "evaluate_evidence_completeness"):
+            evidence_eval = self.evaluate_evidence_completeness(
+                case_id=grievance_id,
+                member_token=member_token,
+                identified_witnesses=int(identified_witnesses),
+                verified_witness_statements=int(verified_witnesses),
+                member_rebuttal_recorded=bool(member_rebuttal_recorded),
+                defense_reconciled=bool(defense_reconciled),
+                employer_documents_only=False,
+            )
+
+        evidence_verdict = (
+            evidence_eval.get("verdict") if isinstance(evidence_eval, dict) else "NOT_EVALUATED"
+        )
+        grievance_state = (
+            "GRIEVANCE_OPEN_VERIFIED"
+            if evidence_verdict == "EVIDENCE_COMPLETE"
+            else "GRIEVANCE_OPEN_DEFICIT_FLAGGED"
+        )
+
+        payload = {
+            "grievance_id": grievance_id,
+            "member_token": member_token,
+            "member_standing": member_standing,
+            "category": category.strip(),
+            "summary": summary.strip(),
+            "evidence_verdict": evidence_verdict,
+            "completeness_score": evidence_eval.get("completeness_score") if isinstance(evidence_eval, dict) else None,
+            "status": grievance_state,
+        }
+
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="MEMBER_GRIEVANCE_01_FILING",
+                entity_type="MEMBER_GRIEVANCE",
+                entity_id=grievance_id,
+                from_state="NONE",
+                to_state=grievance_state,
+                bucket_code=None,
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    def evaluate_anti_hoarding_cap(
+        self: CoopBankLedger,
+        max_reserve_ceiling_cents: int,
+        min_reserve_floor_cents: int = 0,
+        surplus_return_share: float = 0.50,
+        source_bucket: str = "BUCKET_LENDING_POOL",
+        mode: str = "cap",
+    ) -> Dict[str, Any]:
+        if int(max_reserve_ceiling_cents) < 0:
+            raise ValueError("max_reserve_ceiling_cents must be non-negative")
+        if int(min_reserve_floor_cents) < 0:
+            raise ValueError("min_reserve_floor_cents must be non-negative")
+        if int(max_reserve_ceiling_cents) < int(min_reserve_floor_cents):
+            raise ValueError("max_reserve_ceiling_cents cannot be below min_reserve_floor_cents")
+        if not (0.0 <= float(surplus_return_share) <= 1.0):
+            raise ValueError("surplus_return_share must be between 0.0 and 1.0")
+        if mode not in ("reject", "cap"):
+            raise ValueError("mode must be 'reject' or 'cap'")
+
+        bucket_rows = self.conn.execute(
+            "SELECT bucket_code, balance_cents FROM buckets ORDER BY bucket_code ASC"
+        ).fetchall()
+        buckets_map = {r["bucket_code"]: int(r["balance_cents"]) for r in bucket_rows}
+        total_reserves_cents = sum(buckets_map.values())
+
+        ceiling_cents = int(max_reserve_ceiling_cents)
+        floor_cents = int(min_reserve_floor_cents)
+        excess_surplus_cents = max(0, total_reserves_cents - ceiling_cents)
+
+        source_balance_cents = buckets_map.get(source_bucket, 0)
+        spendable_from_source = max(0, source_balance_cents - floor_cents)
+
+        if excess_surplus_cents == 0:
+            flag = "WITHIN_ANTI_HOARDING_CEILING"
+            verdict = "NO_SURPLUS_EXCESS"
+            return_pool_cents = 0
+        else:
+            flag = "SURPLUS_RETURN_REQUIRED"
+            raw_return = int((excess_surplus_cents * float(surplus_return_share)) // 1)
+            if mode == "reject" and raw_return > spendable_from_source:
+                raise ValueError(
+                    f"Anti-hoarding surplus return exceeds spendable reserve in {source_bucket}: "
+                    f"return={raw_return}c > spendable={spendable_from_source}c"
+                )
+            return_pool_cents = min(raw_return, spendable_from_source)
+            verdict = "SURPLUS_RETURN_ALLOCATED" if return_pool_cents > 0 else "SURPLUS_FLAGGED_FLOOR_PROTECTED"
+
+        new_source_balance = source_balance_cents - return_pool_cents
+        if return_pool_cents > 0 and source_bucket in buckets_map:
+            self.conn.execute(
+                "UPDATE buckets SET balance_cents = ? WHERE bucket_code = ?",
+                (new_source_balance, source_bucket),
+            )
+            buckets_map[source_bucket] = new_source_balance
+
+        payload = {
+            "rule_code": "GOVERNANCE_02_ANTI_HOARDING_CAP",
+            "verdict": verdict,
+            "anti_hoarding_flag": flag,
+            "mode": mode,
+            "total_reserves_before_cents": total_reserves_cents,
+            "max_reserve_ceiling_cents": ceiling_cents,
+            "min_reserve_floor_cents": floor_cents,
+            "excess_surplus_cents": excess_surplus_cents,
+            "surplus_return_share": float(surplus_return_share),
+            "source_bucket": source_bucket,
+            "surplus_return_pool_cents": return_pool_cents,
+            "buckets_after_cents": buckets_map,
+            "total_reserves_after_cents": sum(buckets_map.values()),
+        }
+
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="GOVERNANCE_02_ANTI_HOARDING_CAP",
+                entity_type="RESERVE_CEILING",
+                entity_id=source_bucket,
+                from_state="RESERVE_CHECK",
+                to_state=verdict,
+                bucket_code=source_bucket if return_pool_cents > 0 else None,
+                delta_cents=-return_pool_cents,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger.file_membership_grievance = file_membership_grievance
+    CoopBankLedger.evaluate_anti_hoarding_cap = evaluate_anti_hoarding_cap
+
     def evaluate_evidence_completeness(
         self: CoopBankLedger,
         case_id: str,

@@ -1,6 +1,6 @@
 # Cooperative Bank Ledger Extension (`coop_bank_ledger`)
 
-Zero-dependency, local-first SQLite ledger prototype with SHA-256 hash chaining, ring-fenced bucket allocation, deterministic strike-necessity governance, economic balance checks, worker mortgage strike-deferral/resumption rules, post-retirement membership & capped hardship rules, equalized retiree interest disbursement, advocacy evidence/witness completeness checks, universal member/retiree ledger auditing, and ISO/IEC 12207 lifecycle verification.
+Zero-dependency, local-first SQLite ledger prototype with SHA-256 hash chaining, ring-fenced bucket allocation, deterministic strike-necessity governance, economic balance checks, worker mortgage strike-deferral/resumption rules, post-retirement membership & capped hardship rules, equalized retiree interest disbursement, advocacy evidence/witness completeness checks, internal member grievance filing, anti-hoarding surplus return caps, universal member/retiree ledger auditing, and ISO/IEC 12207 lifecycle verification.
 
 ## Bucket Allocation
 * **Lending Pool (`BUCKET_LENDING_POOL`)**: `55%` (`0.55`)
@@ -12,13 +12,14 @@ Zero-dependency, local-first SQLite ledger prototype with SHA-256 hash chaining,
 python3 coop_bank_ledger_prototype.py --mode reject|cap --test all|stress|tamper [--check-iso12207] [--export-bundle path/to/bundle.json]
 ~~~
 
-## Deterministic Governance (`GOVERNANCE_01_STRIKE_NECESSITY`)
-`CoopBankLedger.evaluate_strike_necessity()` evaluates objective workplace, economic balance, and ledger liquidity signals, then appends the verdict (`STRIKE_NOT_NECESSARY`, `MEDIATION_ALERT`, `MEDIATION_OVER_DEMAND_CHECK`, `STRIKE_DEFERRED_INSUFFICIENT_RESERVE`, or `STRIKE_NECESSARY`) and `balance_flag` to the SHA-256 event chain:
-* **Procedural Breach Rate**: `invalid_disciplinary_signings / total_disciplinary_signings` (greater than `15%` default threshold)
-* **Unresolved Grievance Rate**: `unresolved_grievances / total_grievances` (greater than `10%` default threshold)
-* **Safety Deficit Rate**: `unresolved_safety_hazards / total_safety_checks` (greater than `10%` default threshold)
-* **Bargaining Impasse**: `contract_expired`, `mediation_exhausted`, and `real_wage_gap_pct` greater than `3%` default threshold
-* **Liquidity Readiness**: `BUCKET_HARDSHIP_RESERVE + BUCKET_LENDING_POOL` greater than or equal to `min_strike_runway_cents`
+## Deterministic Governance (`GOVERNANCE_01_STRIKE_NECESSITY`, `GOVERNANCE_02_ANTI_HOARDING_CAP`)
+* **`evaluate_strike_necessity()` (`GOVERNANCE_01_STRIKE_NECESSITY`)**: Evaluates objective workplace, economic balance, and ledger liquidity signals, then appends the verdict (`STRIKE_NOT_NECESSARY`, `MEDIATION_ALERT`, `MEDIATION_OVER_DEMAND_CHECK`, `STRIKE_DEFERRED_INSUFFICIENT_RESERVE`, or `STRIKE_NECESSARY`) and `balance_flag` to the SHA-256 event chain:
+  * **Procedural Breach Rate**: `invalid_disciplinary_signings / total_disciplinary_signings` (greater than `15%` default threshold)
+  * **Unresolved Grievance Rate**: `unresolved_grievances / total_grievances` (greater than `10%` default threshold)
+  * **Safety Deficit Rate**: `unresolved_safety_hazards / total_safety_checks` (greater than `10%` default threshold)
+  * **Bargaining Impasse**: `contract_expired`, `mediation_exhausted`, and `real_wage_gap_pct` greater than `3%` default threshold
+  * **Liquidity Readiness**: `BUCKET_HARDSHIP_RESERVE + BUCKET_LENDING_POOL` greater than or equal to `min_strike_runway_cents`
+* **`evaluate_anti_hoarding_cap()` (`GOVERNANCE_02_ANTI_HOARDING_CAP`)**: Compares total bucket reserves against `max_reserve_ceiling_cents` and `min_reserve_floor_cents`, flags `SURPLUS_RETURN_REQUIRED` when excess surplus exists, and computes/allocates a capped surplus return pool (`mode="reject"` or `mode="cap"`) to counter centralizing accumulation.
 
 ## Economic & Safety Balance Flags
 * **`PROFIT_OVER_SAFETY`**: Employer operating margin is healthy (`employer_operating_margin_pct >= 10%`) while workplace safety/fairness deficit is elevated (`safety_deficit_rate > 10%` or `procedural_breach_rate > 15%`).
@@ -36,9 +37,10 @@ python3 coop_bank_ledger_prototype.py --mode reject|cap --test all|stress|tamper
 * **`claim_retiree_hardship()` (`RETIREE_01_HARDSHIP_CLAIM`)**: Draws capped hardship relief from `BUCKET_HARDSHIP_RESERVE` subject to remaining member retiree cap and `min_reserve_floor_cents` (`mode="reject"` or `mode="cap"`).
 * **`distribute_retiree_interest()` (`RETIREE_02_INTEREST_EQUALIZATION`)**: Disburses yield in exact integer cents using tenure and an inverse-contribution equalizer multiplier `(1 + alpha) / (1 + alpha * recent_contribution_count)` so retirees with lower recent contribution counts receive balanced equalization rather than pure balance concentration.
 
-## Advocacy Evidence & Universal Member Audit (`ADVOCACY_01_EVIDENCE_COMPLETENESS`, `AUDIT_01_UNIVERSAL_LEDGER_AUDIT`)
-* **`evaluate_evidence_completeness()`**: Computes a weighted `completeness_score` (`0.0` to `1.0`) across verified witness statements, recorded member rebuttals, defense-summary reconciliation, and uncorroborated employer-only records, appending `EVIDENCE_COMPLETE` or `ADVOCACY_EVIDENCE_DEFICIT` to the SHA-256 event chain.
-* **`audit_ledger_as_member()`**: Allows any active member (`AUDITOR_ACTIVE_MEMBER`) or retired member (`AUDITOR_MEMBER_RETIRED`) to independently verify hash-chain linkage, bucket balances, and ledger counts with a cryptographic audit receipt.
+## Member Grievances, Advocacy Evidence & Universal Member Audit (`MEMBER_GRIEVANCE_01_FILING`, `ADVOCACY_01_EVIDENCE_COMPLETENESS`, `AUDIT_01_UNIVERSAL_LEDGER_AUDIT`)
+* **`file_membership_grievance()` (`MEMBER_GRIEVANCE_01_FILING`)**: Records immutable internal membership grievances for active or retired members into the SHA-256 chain with integrated evidence-completeness scoring.
+* **`evaluate_evidence_completeness()` (`ADVOCACY_01_EVIDENCE_COMPLETENESS`)**: Computes a weighted `completeness_score` (`0.0` to `1.0`) across verified witness statements, recorded member rebuttals, defense-summary reconciliation, and uncorroborated employer-only records, appending `EVIDENCE_COMPLETE` or `ADVOCACY_EVIDENCE_DEFICIT` to the SHA-256 event chain.
+* **`audit_ledger_as_member()` (`AUDIT_01_UNIVERSAL_LEDGER_AUDIT`)**: Allows any active member (`AUDITOR_ACTIVE_MEMBER`) or retired member (`AUDITOR_MEMBER_RETIRED`) to independently verify hash-chain linkage, bucket balances, and ledger counts with a cryptographic audit receipt.
 
 ## Integrity & Compliance Checks
 * **Hash Chain & Bundle Digest**: Verifies `prev_hash` / `event_hash` links across `ledger_events` and recomputes `bundle_sha256` over the canonical JSON body.

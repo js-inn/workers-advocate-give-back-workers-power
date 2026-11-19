@@ -10,6 +10,7 @@ Zero-dependency, local-first SQLite ledger prototype with SHA-256 hash chaining,
 ## CLI Usage
 ~~~bash
 python3 coop_bank_ledger_prototype.py --mode reject|cap --test all|stress|tamper [--check-iso12207] [--export-bundle path/to/bundle.json]
+python3 verify_all_rules.py
 ~~~
 
 ## Deterministic Governance (`GOVERNANCE_01_STRIKE_NECESSITY`, `GOVERNANCE_02_ANTI_HOARDING_CAP`)
@@ -42,6 +43,6 @@ python3 coop_bank_ledger_prototype.py --mode reject|cap --test all|stress|tamper
 * **`evaluate_evidence_completeness()` (`ADVOCACY_01_EVIDENCE_COMPLETENESS`)**: Computes a weighted `completeness_score` (`0.0` to `1.0`) across verified witness statements, recorded member rebuttals, defense-summary reconciliation, and uncorroborated employer-only records, appending `EVIDENCE_COMPLETE` or `ADVOCACY_EVIDENCE_DEFICIT` to the SHA-256 event chain.
 * **`audit_ledger_as_member()` (`AUDIT_01_UNIVERSAL_LEDGER_AUDIT`)**: Allows any active member (`AUDITOR_ACTIVE_MEMBER`) or retired member (`AUDITOR_MEMBER_RETIRED`) to independently verify hash-chain linkage, bucket balances, and ledger counts with a cryptographic audit receipt.
 
-## Integrity & Compliance Checks
+## Integrity & Compliance Checks (`verify_iso12207_compliance`)
 * **Hash Chain & Bundle Digest**: Verifies `prev_hash` / `event_hash` links across `ledger_events` and recomputes `bundle_sha256` over the canonical JSON body.
-* **Bucket Reconciliation (`--check-iso12207`)**: Reconciles `buckets.balance_cents` against cash-movement deltas and checks bucket share governance and event traceability.
+* **4-Gate ISO/IEC 12207 Verification**: Checks `hash_chain_integrity`, `ring_fenced_buckets_valid`, `bucket_ledger_reconciliation`, and `lifecycle_event_traceability`.

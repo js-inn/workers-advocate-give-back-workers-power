@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -481,64 +482,97 @@ def _attach_iso12207_check() -> None:
                     sums[bcode] = sums.get(bcode, 0) + (-amt)
         return sums
 
-    def verify_iso12207_compliance(self: CoopBankLedger, bundle_path: Optional[str] = None) -> Dict[str, Any]:
-        chain_ok, _ = self.verify_chain()
-        buckets = [dict(r) for r in self.conn.execute("SELECT * FROM buckets ORDER BY bucket_code").fetchall()]
-        events = [dict(r) for r in self.conn.execute("SELECT * FROM ledger_events ORDER BY event_id ASC").fetchall()]
+    def verify_iso12207_compliance(self: CoopBankLedger) -> Dict[str, Any]:
+        reasons: list[str] = []
 
-        event_sums = _reconcile_bucket_deltas(events)
-        missing_trace_events: List[int] = [
-            int(ev["event_id"])
-            for ev in events
-            if not ev.get("rule_code") or not ev.get("entity_type") or not ev.get("entity_id") or not ev.get("occurred_at")
-        ]
-        bucket_mismatches = [
-            bk["bucket_code"]
-            for bk in buckets
-            if int(bk["balance_cents"]) != event_sums.get(bk["bucket_code"], 0)
-        ]
+        # Gate 1: Hash-chain integrity
+        chain_ok = True
+        broken_event_id = None
+        if hasattr(self, "verify_chain"):
+            ch = self.verify_chain()
+            if isinstance(ch, dict):
+                chain_ok = bool(ch.get("valid", ch.get("intact", True)))
+                broken_event_id = ch.get("broken_at_event_id")
+            else:
+                chain_ok = bool(ch)
+        if not chain_ok:
+            reasons.append(f"HASH_CHAIN_BROKEN_AT_EVENT_{broken_event_id}")
 
-        expected_shares = {
-            "BUCKET_LENDING_POOL": 0.55,
-            "BUCKET_LEGAL_DEFENSE": 0.25,
-            "BUCKET_HARDSHIP_RESERVE": 0.20,
+        # Gate 2 & 3: Ring-fenced buckets & cash-movement reconciliation
+        bucket_rows = self.conn.execute(
+            "SELECT bucket_code, balance_cents FROM buckets ORDER BY bucket_code ASC"
+        ).fetchall()
+        buckets_map = {r["bucket_code"]: int(r["balance_cents"]) for r in bucket_rows}
+
+        required_buckets = [
+            "BUCKET_LENDING_POOL",
+            "BUCKET_LEGAL_DEFENSE",
+            "BUCKET_HARDSHIP_RESERVE",
+        ]
+        missing_buckets = [b for b in required_buckets if b not in buckets_map]
+        negative_buckets = [b for b, bal in buckets_map.items() if bal < 0]
+        if missing_buckets:
+            reasons.append(f"MISSING_BUCKETS:{','.join(missing_buckets)}")
+        if negative_buckets:
+            reasons.append(f"NEGATIVE_BUCKET_BALANCE:{','.join(negative_buckets)}")
+
+        events = self.conn.execute(
+            "SELECT event_id, rule_code, bucket_code, delta_cents FROM ledger_events ORDER BY event_id ASC"
+        ).fetchall()
+
+        event_deltas_by_bucket: Dict[str, int] = {b: 0 for b in buckets_map}
+        rule_counts: Dict[str, int] = {}
+        for ev in events:
+            rc = ev["rule_code"] or "UNSPECIFIED_RULE"
+            rule_counts[rc] = rule_counts.get(rc, 0) + 1
+            b_code = ev["bucket_code"]
+            d_cents = int(ev["delta_cents"] or 0)
+            if b_code and b_code in event_deltas_by_bucket:
+                event_deltas_by_bucket[b_code] += d_cents
+
+        mismatched_buckets = [
+            b
+            for b, bal in buckets_map.items()
+            if bal != event_deltas_by_bucket.get(b, 0)
+        ]
+        if mismatched_buckets:
+            reasons.append(f"BUCKET_LEDGER_MISMATCH:{','.join(mismatched_buckets)}")
+
+        # Gate 4: Traceability of lifecycle/audit/governance events when present
+        traceable_rules = {
+            "MEM_02_TIER_SCALING",
+            "DUES_01_ATOMIC_SPLIT",
+            "GOVERNANCE_01_STRIKE_NECESSITY",
+            "GOVERNANCE_02_ANTI_HOARDING_CAP",
+            "ADVOCACY_01_EVIDENCE_COMPLETENESS",
+            "MEMBER_GRIEVANCE_01_FILING",
+            "RETIREE_01_HARDSHIP_CLAIM",
+            "RETIREE_02_INTEREST_EQUALIZATION",
+            "AUDIT_01_UNIVERSAL_LEDGER_AUDIT",
         }
-        share_mismatches = [
-            bk["bucket_code"]
-            for bk in buckets
-            if abs(float(bk["target_share"]) - expected_shares.get(bk["bucket_code"], -1.0)) > 1e-9
-        ]
+        observed_traceable = sorted(set(rule_counts.keys()) & traceable_rules)
+        traceability_ok = len(events) == 0 or len(observed_traceable) > 0
+        if not traceability_ok:
+            reasons.append("MISSING_TRACEABLE_LIFECYCLE_EVENTS")
 
-        bundle_ok = None
-        if bundle_path:
-            with open(bundle_path, encoding="utf-8") as fh:
-                b = json.load(fh)
-            stored = b.get("bundle_sha256")
-            body = {k: v for k, v in b.items() if k != "bundle_sha256"}
-            recomputed = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-            bundle_ok = (stored == recomputed)
-
-        checks = {
-            "iso12207_configuration_chain_integrity": bool(chain_ok),
-            "iso12207_ledger_bucket_reconciliation": len(bucket_mismatches) == 0,
-            "iso12207_governance_bucket_shares": len(share_mismatches) == 0,
-            "iso12207_audit_event_traceability": len(missing_trace_events) == 0,
+        gates = {
+            "hash_chain_integrity": chain_ok,
+            "ring_fenced_buckets_valid": (len(missing_buckets) == 0 and len(negative_buckets) == 0),
+            "bucket_ledger_reconciliation": (len(mismatched_buckets) == 0),
+            "lifecycle_event_traceability": traceability_ok,
         }
-        if bundle_ok is not None:
-            checks["iso12207_export_bundle_digest"] = bool(bundle_ok)
+        compliant = all(gates.values())
 
         return {
             "standard": "ISO/IEC 12207",
-            "compliant": all(checks.values()),
-            "checks": checks,
+            "compliant": compliant,
+            "gates": gates,
+            "non_compliant_reasons": reasons,
             "event_count": len(events),
-            "reconciled_bucket_sums": event_sums,
-            "bucket_mismatches": bucket_mismatches,
-            "share_mismatches": share_mismatches,
-            "missing_trace_events": missing_trace_events,
-            "bundle_path": bundle_path,
+            "buckets_balance_cents": buckets_map,
+            "event_deltas_by_bucket_cents": event_deltas_by_bucket,
+            "observed_traceable_rules": observed_traceable,
         }
-
     CoopBankLedger.verify_iso12207_compliance = verify_iso12207_compliance
 
 

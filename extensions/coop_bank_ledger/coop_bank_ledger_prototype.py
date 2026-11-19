@@ -717,6 +717,877 @@ def _attach_strike_necessity_gate() -> None:
 
 _attach_strike_necessity_gate()
 
+def _attach_mortgage_strike_deferral_rule() -> None:
+    def _ensure_mortgages_table(self: CoopBankLedger) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mortgages (
+                mortgage_id TEXT PRIMARY KEY,
+                member_token TEXT NOT NULL,
+                unit_id TEXT NOT NULL,
+                principal_cents INTEGER NOT NULL,
+                remaining_principal_cents INTEGER NOT NULL,
+                monthly_payment_cents INTEGER NOT NULL,
+                deferred_balance_cents INTEGER NOT NULL DEFAULT 0,
+                deferred_months_used INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'MORTGAGE_ACTIVE',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.commit()
+
+    def create_mortgage(
+        self: CoopBankLedger,
+        mortgage_id: str,
+        member_token: str,
+        unit_id: str,
+        principal_cents: int,
+        monthly_payment_cents: int,
+    ) -> Dict[str, Any]:
+        assert member_token.startswith("[Member_"), f"Invalid member token: {member_token}"
+        if principal_cents <= 0 or monthly_payment_cents <= 0:
+            raise ValueError("Principal and monthly payment must be positive cents")
+        self._ensure_mortgages_table()
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO mortgages (
+                mortgage_id, member_token, unit_id, principal_cents,
+                remaining_principal_cents, monthly_payment_cents,
+                deferred_balance_cents, deferred_months_used, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'MORTGAGE_ACTIVE', ?)
+            """,
+            (
+                mortgage_id,
+                member_token,
+                unit_id,
+                int(principal_cents),
+                int(principal_cents),
+                int(monthly_payment_cents),
+                occurred_at,
+            ),
+        )
+        payload = {
+            "mortgage_id": mortgage_id,
+            "member_token": member_token,
+            "unit_id": unit_id,
+            "principal_cents": int(principal_cents),
+            "monthly_payment_cents": int(monthly_payment_cents),
+            "status": "MORTGAGE_ACTIVE",
+        }
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="MORTGAGE_00_ORIGINATED",
+                entity_type="MORTGAGE",
+                entity_id=mortgage_id,
+                from_state="NONE",
+                to_state="MORTGAGE_ACTIVE",
+                bucket_code=None,
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+        return payload
+
+    def apply_strike_mortgage_deferral(
+        self: CoopBankLedger,
+        mortgage_id: str,
+        months_requested: int = 1,
+        max_deferral_months: int = 3,
+        min_reserve_floor_cents: int = 0,
+        mode: str = "cap",
+    ) -> Dict[str, Any]:
+        if months_requested <= 0:
+            raise ValueError("months_requested must be positive")
+        if mode not in ("reject", "cap"):
+            raise ValueError("mode must be 'reject' or 'cap'")
+        self._ensure_mortgages_table()
+
+        row = self.conn.execute(
+            "SELECT * FROM mortgages WHERE mortgage_id = ?",
+            (mortgage_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"Unknown mortgage_id: {mortgage_id}")
+
+        unit_id = row["unit_id"]
+        verdict_row = self.conn.execute(
+            """
+            SELECT to_state FROM ledger_events
+            WHERE rule_code = 'GOVERNANCE_01_STRIKE_NECESSITY' AND entity_id = ?
+            ORDER BY event_id DESC LIMIT 1
+            """,
+            (unit_id,),
+        ).fetchone()
+        latest_verdict = verdict_row["to_state"] if verdict_row else "UNASSESSED"
+        if latest_verdict != "STRIKE_NECESSARY":
+            raise ValueError(
+                f"Mortgage strike deferral requires STRIKE_NECESSARY for {unit_id}, got {latest_verdict}"
+            )
+
+        used_months = int(row["deferred_months_used"])
+        allowed_months = max(0, int(max_deferral_months) - used_months)
+        effective_months = min(int(months_requested), allowed_months)
+        if effective_months <= 0:
+            raise ValueError(
+                f"Deferral cap reached for {mortgage_id}: used={used_months}, max={max_deferral_months}"
+            )
+
+        requested_cents = effective_months * int(row["monthly_payment_cents"])
+        bucket_row = self.conn.execute(
+            "SELECT balance_cents FROM buckets WHERE bucket_code = 'BUCKET_HARDSHIP_RESERVE'"
+        ).fetchone()
+        reserve_cents = int(bucket_row["balance_cents"]) if bucket_row else 0
+        spendable_reserve = max(0, reserve_cents - int(min_reserve_floor_cents))
+
+        if mode == "reject" and requested_cents > spendable_reserve:
+            raise ValueError(
+                f"Mortgage deferral reserve shortfall: requested={requested_cents}c > available={spendable_reserve}c"
+            )
+
+        deferred_cents = requested_cents if mode == "reject" else min(requested_cents, spendable_reserve)
+        uncovered_cents = max(0, requested_cents - deferred_cents)
+        months_granted = deferred_cents // int(row["monthly_payment_cents"])
+        next_status = "STRIKE_DEFERRED" if uncovered_cents == 0 else "STRIKE_DEFERRED_PARTIAL"
+
+        new_deferred_balance = int(row["deferred_balance_cents"]) + deferred_cents
+        new_months_used = used_months + months_granted
+
+        self.conn.execute(
+            """
+            UPDATE mortgages
+            SET deferred_balance_cents = ?, deferred_months_used = ?, status = ?
+            WHERE mortgage_id = ?
+            """,
+            (new_deferred_balance, new_months_used, next_status, mortgage_id),
+        )
+
+        payload = {
+            "mortgage_id": mortgage_id,
+            "member_token": row["member_token"],
+            "unit_id": unit_id,
+            "strike_verdict": latest_verdict,
+            "mode": mode,
+            "requested_cents": requested_cents,
+            "deferred_cents": deferred_cents,
+            "uncovered_cents": uncovered_cents,
+            "months_granted": months_granted,
+            "deferred_months_used": new_months_used,
+            "deferred_balance_cents": new_deferred_balance,
+            "min_reserve_floor_cents": int(min_reserve_floor_cents),
+            "status": next_status,
+        }
+
+        from_state = row["status"]
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="MORTGAGE_01_STRIKE_DEFERRAL",
+                entity_type="MORTGAGE",
+                entity_id=mortgage_id,
+                from_state=from_state,
+                to_state=next_status,
+                bucket_code="BUCKET_HARDSHIP_RESERVE",
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger._ensure_mortgages_table = _ensure_mortgages_table
+    CoopBankLedger.create_mortgage = create_mortgage
+    CoopBankLedger.apply_strike_mortgage_deferral = apply_strike_mortgage_deferral
+
+    def resume_mortgage_after_strike(
+        self: CoopBankLedger,
+        mortgage_id: str,
+        repayment_mode: str = "append_term",
+        repayment_months: int = 12,
+        require_strike_resolved: bool = False,
+    ) -> Dict[str, Any]:
+        if repayment_mode not in ("append_term", "recalculate_installment"):
+            raise ValueError("repayment_mode must be 'append_term' or 'recalculate_installment'")
+        if repayment_months <= 0:
+            raise ValueError("repayment_months must be positive")
+
+        self._ensure_mortgages_table()
+        row = self.conn.execute(
+            "SELECT * FROM mortgages WHERE mortgage_id = ?",
+            (mortgage_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"Unknown mortgage_id: {mortgage_id}")
+
+        from_state = row["status"]
+        if from_state not in ("STRIKE_DEFERRED", "STRIKE_DEFERRED_PARTIAL"):
+            raise ValueError(
+                f"Cannot resume mortgage {mortgage_id} from state {from_state}; expected STRIKE_DEFERRED or STRIKE_DEFERRED_PARTIAL"
+            )
+
+        unit_id = row["unit_id"]
+        verdict_row = self.conn.execute(
+            """
+            SELECT to_state FROM ledger_events
+            WHERE rule_code = 'GOVERNANCE_01_STRIKE_NECESSITY' AND entity_id = ?
+            ORDER BY event_id DESC LIMIT 1
+            """,
+            (unit_id,),
+        ).fetchone()
+        latest_verdict = verdict_row["to_state"] if verdict_row else "UNASSESSED"
+        if require_strike_resolved and latest_verdict == "STRIKE_NECESSARY":
+            raise ValueError(
+                f"Strike still active (STRIKE_NECESSARY) for {unit_id}; cannot resume with require_strike_resolved=True"
+            )
+
+        deferred_cents = int(row["deferred_balance_cents"])
+        monthly_cents = int(row["monthly_payment_cents"])
+        estimated_added_months = math.ceil(deferred_cents / monthly_cents) if deferred_cents > 0 else 0
+        additional_monthly_cents = (
+            math.ceil(deferred_cents / repayment_months)
+            if (repayment_mode == "recalculate_installment" and deferred_cents > 0)
+            else 0
+        )
+
+        next_status = "MORTGAGE_ACTIVE"
+        self.conn.execute(
+            """
+            UPDATE mortgages
+            SET status = ?
+            WHERE mortgage_id = ?
+            """,
+            (next_status, mortgage_id),
+        )
+
+        payload = {
+            "mortgage_id": mortgage_id,
+            "member_token": row["member_token"],
+            "unit_id": unit_id,
+            "strike_verdict_at_resume": latest_verdict,
+            "repayment_mode": repayment_mode,
+            "deferred_balance_cents": deferred_cents,
+            "deferred_months_used": int(row["deferred_months_used"]),
+            "estimated_added_months": estimated_added_months,
+            "additional_monthly_cents": additional_monthly_cents,
+            "repayment_months": int(repayment_months),
+            "status": next_status,
+        }
+
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="MORTGAGE_02_POST_STRIKE_RESUME",
+                entity_type="MORTGAGE",
+                entity_id=mortgage_id,
+                from_state=from_state,
+                to_state=next_status,
+                bucket_code=None,
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger.resume_mortgage_after_strike = resume_mortgage_after_strike
+
+    def _ensure_retiree_table(self: CoopBankLedger) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS retiree_members (
+                member_token TEXT PRIMARY KEY,
+                tenure_months INTEGER NOT NULL,
+                retiree_hardship_cap_cents INTEGER NOT NULL,
+                retiree_hardship_used_cents INTEGER NOT NULL DEFAULT 0,
+                mortgage_shield_active INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'MEMBER_RETIRED',
+                retired_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.commit()
+
+    def retire_member(
+        self: CoopBankLedger,
+        member_token: str,
+        tenure_months: int,
+        min_retirement_tenure_months: int = 60,
+        retiree_hardship_cap_cents: int = 500_000,
+    ) -> Dict[str, Any]:
+        assert member_token.startswith("[Member_"), f"Invalid member token: {member_token}"
+        if tenure_months < int(min_retirement_tenure_months):
+            raise ValueError(
+                f"Member {member_token} tenure_months={tenure_months} below minimum {min_retirement_tenure_months}"
+            )
+        if retiree_hardship_cap_cents < 0:
+            raise ValueError("retiree_hardship_cap_cents must be non-negative")
+
+        self._ensure_retiree_table()
+        existing = self.conn.execute(
+            "SELECT * FROM retiree_members WHERE member_token = ?",
+            (member_token,),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Member {member_token} is already in {existing['status']}")
+
+        # Check if member holds any existing mortgage and protect it from retirement recall/acceleration
+        mortgages_table = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mortgages'"
+        ).fetchone()
+        protected_mortgages: list[str] = []
+        if mortgages_table:
+            rows = self.conn.execute(
+                "SELECT mortgage_id, status FROM mortgages WHERE member_token = ?",
+                (member_token,),
+            ).fetchall()
+            for m in rows:
+                protected_mortgages.append(m["mortgage_id"])
+                if m["status"] == "MORTGAGE_RECALLED":
+                    self.conn.execute(
+                        "UPDATE mortgages SET status = 'MORTGAGE_ACTIVE' WHERE mortgage_id = ?",
+                        (m["mortgage_id"],),
+                    )
+
+        retired_at = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO retiree_members (
+                member_token, tenure_months, retiree_hardship_cap_cents,
+                retiree_hardship_used_cents, mortgage_shield_active, status, retired_at
+            ) VALUES (?, ?, ?, 0, 1, 'MEMBER_RETIRED', ?)
+            """,
+            (
+                member_token,
+                int(tenure_months),
+                int(retiree_hardship_cap_cents),
+                retired_at,
+            ),
+        )
+
+        payload = {
+            "member_token": member_token,
+            "status": "MEMBER_RETIRED",
+            "tenure_months": int(tenure_months),
+            "min_retirement_tenure_months": int(min_retirement_tenure_months),
+            "retiree_hardship_cap_cents": int(retiree_hardship_cap_cents),
+            "retiree_hardship_used_cents": 0,
+            "mortgage_shield_active": True,
+            "protected_mortgage_ids": protected_mortgages,
+        }
+
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="MEMBER_01_RETIREMENT_TRANSITION",
+                entity_type="MEMBER",
+                entity_id=member_token,
+                from_state="ACTIVE",
+                to_state="MEMBER_RETIRED",
+                bucket_code=None,
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    def claim_retiree_hardship(
+        self: CoopBankLedger,
+        member_token: str,
+        requested_cents: int,
+        min_reserve_floor_cents: int = 0,
+        mode: str = "cap",
+    ) -> Dict[str, Any]:
+        if requested_cents <= 0:
+            raise ValueError("requested_cents must be positive")
+        if min_reserve_floor_cents < 0:
+            raise ValueError("min_reserve_floor_cents must be non-negative")
+        if mode not in ("reject", "cap"):
+            raise ValueError("mode must be 'reject' or 'cap'")
+
+        self._ensure_retiree_table()
+        row = self.conn.execute(
+            "SELECT * FROM retiree_members WHERE member_token = ?",
+            (member_token,),
+        ).fetchone()
+        if not row or row["status"] != "MEMBER_RETIRED":
+            raise ValueError(f"Member {member_token} is not in MEMBER_RETIRED status")
+
+        used_cents = int(row["retiree_hardship_used_cents"])
+        cap_cents = int(row["retiree_hardship_cap_cents"])
+        remaining_member_cap = max(0, cap_cents - used_cents)
+
+        bucket_row = self.conn.execute(
+            "SELECT balance_cents FROM buckets WHERE bucket_code = 'BUCKET_HARDSHIP_RESERVE'"
+        ).fetchone()
+        reserve_cents = int(bucket_row["balance_cents"]) if bucket_row else 0
+        spendable_reserve = max(0, reserve_cents - int(min_reserve_floor_cents))
+
+        max_allowable = min(remaining_member_cap, spendable_reserve)
+        if mode == "reject" and requested_cents > max_allowable:
+            raise ValueError(
+                f"Retiree hardship claim exceeds cap/reserve: requested={requested_cents}c, allowable={max_allowable}c"
+            )
+
+        granted_cents = requested_cents if mode == "reject" else min(int(requested_cents), max_allowable)
+        uncovered_cents = max(0, int(requested_cents) - granted_cents)
+        new_used_cents = used_cents + granted_cents
+        new_reserve_cents = reserve_cents - granted_cents
+
+        self.conn.execute(
+            """
+            UPDATE retiree_members
+            SET retiree_hardship_used_cents = ?
+            WHERE member_token = ?
+            """,
+            (new_used_cents, member_token),
+        )
+        if bucket_row and granted_cents > 0:
+            self.conn.execute(
+                """
+                UPDATE buckets
+                SET balance_cents = ?
+                WHERE bucket_code = 'BUCKET_HARDSHIP_RESERVE'
+                """,
+                (new_reserve_cents,),
+            )
+
+        payload = {
+            "member_token": member_token,
+            "status": "MEMBER_RETIRED",
+            "mode": mode,
+            "requested_cents": int(requested_cents),
+            "granted_cents": granted_cents,
+            "uncovered_cents": uncovered_cents,
+            "retiree_hardship_cap_cents": cap_cents,
+            "retiree_hardship_used_cents": new_used_cents,
+            "remaining_retiree_cap_cents": max(0, cap_cents - new_used_cents),
+            "min_reserve_floor_cents": int(min_reserve_floor_cents),
+            "hardship_reserve_after_cents": new_reserve_cents,
+        }
+
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="RETIREE_01_HARDSHIP_CLAIM",
+                entity_type="MEMBER",
+                entity_id=member_token,
+                from_state="MEMBER_RETIRED",
+                to_state="MEMBER_RETIRED",
+                bucket_code="BUCKET_HARDSHIP_RESERVE",
+                delta_cents=-granted_cents,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger._ensure_retiree_table = _ensure_retiree_table
+    CoopBankLedger.retire_member = retire_member
+    CoopBankLedger.claim_retiree_hardship = claim_retiree_hardship
+
+    def distribute_retiree_interest(
+        self: CoopBankLedger,
+        gross_yield_cents: int,
+        retiree_yield_share: float = 0.25,
+        equalization_alpha: float = 2.0,
+        recent_contributions_by_member: Dict[str, int] | None = None,
+        min_reserve_floor_cents: int = 0,
+        source_bucket: str = "BUCKET_HARDSHIP_RESERVE",
+        mode: str = "cap",
+    ) -> Dict[str, Any]:
+        if gross_yield_cents < 0:
+            raise ValueError("gross_yield_cents must be non-negative")
+        if not (0.0 <= float(retiree_yield_share) <= 1.0):
+            raise ValueError("retiree_yield_share must be between 0.0 and 1.0")
+        if float(equalization_alpha) < 0.0:
+            raise ValueError("equalization_alpha must be non-negative")
+        if int(min_reserve_floor_cents) < 0:
+            raise ValueError("min_reserve_floor_cents must be non-negative")
+        if mode not in ("reject", "cap"):
+            raise ValueError("mode must be 'reject' or 'cap'")
+
+        self._ensure_retiree_table()
+        retirees = self.conn.execute(
+            """
+            SELECT member_token, tenure_months
+            FROM retiree_members
+            WHERE status = 'MEMBER_RETIRED'
+            ORDER BY member_token ASC
+            """
+        ).fetchall()
+
+        contrib_map = recent_contributions_by_member or {}
+        for k, v in contrib_map.items():
+            if int(v) < 0:
+                raise ValueError(f"Contribution count for {k} cannot be negative")
+
+        target_pool_cents = int((int(gross_yield_cents) * float(retiree_yield_share)) // 1)
+        bucket_row = self.conn.execute(
+            "SELECT balance_cents FROM buckets WHERE bucket_code = ?",
+            (source_bucket,),
+        ).fetchone()
+        reserve_cents = int(bucket_row["balance_cents"]) if bucket_row else 0
+        spendable_reserve = max(0, reserve_cents - int(min_reserve_floor_cents))
+
+        if mode == "reject" and target_pool_cents > spendable_reserve:
+            raise ValueError(
+                f"Retiree interest pool shortfall: target={target_pool_cents}c > spendable={spendable_reserve}c"
+            )
+
+        pool_cents = target_pool_cents if mode == "reject" else min(target_pool_cents, spendable_reserve)
+        if not retirees or pool_cents <= 0:
+            payouts = [
+                {
+                    "member_token": r["member_token"],
+                    "tenure_months": int(r["tenure_months"]),
+                    "recent_contribution_count": int(contrib_map.get(r["member_token"], 0)),
+                    "equalizer_weight": 0.0,
+                    "payout_cents": 0,
+                }
+                for r in retirees
+            ]
+            payload = {
+                "gross_yield_cents": int(gross_yield_cents),
+                "retiree_yield_share": float(retiree_yield_share),
+                "equalization_alpha": float(equalization_alpha),
+                "target_pool_cents": target_pool_cents,
+                "disbursed_total_cents": 0,
+                "undistributed_cents": target_pool_cents,
+                "source_bucket": source_bucket,
+                "reserve_after_cents": reserve_cents,
+                "payouts": payouts,
+            }
+            if hasattr(self, "_append_event"):
+                self._append_event(
+                    rule_code="RETIREE_02_INTEREST_EQUALIZATION",
+                    entity_type="RETIREE_POOL",
+                    entity_id=source_bucket,
+                    from_state="YIELD_CALCULATED",
+                    to_state="NO_DISTRIBUTION",
+                    bucket_code=source_bucket,
+                    delta_cents=0,
+                    payload=payload,
+                )
+            else:
+                self.conn.commit()
+            return payload
+
+        alpha = float(equalization_alpha)
+        weights: list[tuple[str, int, int, float]] = []
+        total_weight = 0.0
+        for r in retirees:
+            token = r["member_token"]
+            tenure = max(1, int(r["tenure_months"]))
+            c_count = int(contrib_map.get(token, 0))
+            eq_multiplier = (1.0 + alpha) / (1.0 + alpha * c_count)
+            w = float(tenure) * eq_multiplier
+            weights.append((token, tenure, c_count, w))
+            total_weight += w
+
+        exact_shares: list[tuple[str, int, int, float, int, float]] = []
+        floor_sum = 0
+        for token, tenure, c_count, w in weights:
+            exact = (float(pool_cents) * w) / total_weight
+            base_cents = int(exact // 1)
+            fractional = exact - base_cents
+            exact_shares.append((token, tenure, c_count, w, base_cents, fractional))
+            floor_sum += base_cents
+
+        remainder = int(pool_cents - floor_sum)
+        # Deterministic remainder allocation: highest fractional part, tie-broken by member_token ascending
+        ranked_indices = sorted(
+            range(len(exact_shares)),
+            key=lambda idx: (-exact_shares[idx][5], exact_shares[idx][0]),
+        )
+        bonus_map = {idx: 0 for idx in range(len(exact_shares))}
+        for idx in ranked_indices[:remainder]:
+            bonus_map[idx] = 1
+
+        payouts_list: list[Dict[str, Any]] = []
+        disbursed_sum = 0
+        for idx, (token, tenure, c_count, w, base_cents, _) in enumerate(exact_shares):
+            final_cents = base_cents + bonus_map[idx]
+            disbursed_sum += final_cents
+            payouts_list.append(
+                {
+                    "member_token": token,
+                    "tenure_months": tenure,
+                    "recent_contribution_count": c_count,
+                    "equalizer_weight": round(w, 6),
+                    "payout_cents": final_cents,
+                }
+            )
+
+        new_reserve_cents = reserve_cents - disbursed_sum
+        if bucket_row and disbursed_sum > 0:
+            self.conn.execute(
+                "UPDATE buckets SET balance_cents = ? WHERE bucket_code = ?",
+                (new_reserve_cents, source_bucket),
+            )
+
+        payload = {
+            "gross_yield_cents": int(gross_yield_cents),
+            "retiree_yield_share": float(retiree_yield_share),
+            "equalization_alpha": alpha,
+            "target_pool_cents": target_pool_cents,
+            "disbursed_total_cents": disbursed_sum,
+            "undistributed_cents": max(0, target_pool_cents - disbursed_sum),
+            "source_bucket": source_bucket,
+            "reserve_after_cents": new_reserve_cents,
+            "payouts": payouts_list,
+        }
+
+        if hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="RETIREE_02_INTEREST_EQUALIZATION",
+                entity_type="RETIREE_POOL",
+                entity_id=source_bucket,
+                from_state="YIELD_CALCULATED",
+                to_state="EQUALIZED_DISBURSED",
+                bucket_code=source_bucket,
+                delta_cents=-disbursed_sum,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger.distribute_retiree_interest = distribute_retiree_interest
+
+    def audit_ledger_as_member(
+        self: CoopBankLedger,
+        auditor_token: str,
+        record_audit_event: bool = True,
+    ) -> Dict[str, Any]:
+        assert auditor_token.startswith("[Member_"), f"Invalid auditor token: {auditor_token}"
+
+        retiree_table = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='retiree_members'"
+        ).fetchone()
+        retiree_row = None
+        if retiree_table:
+            retiree_row = self.conn.execute(
+                "SELECT member_token, status, tenure_months, retiree_hardship_cap_cents, retiree_hardship_used_cents FROM retiree_members WHERE member_token = ?",
+                (auditor_token,),
+            ).fetchone()
+
+        is_retired = bool(retiree_row and retiree_row["status"] == "MEMBER_RETIRED")
+        auditor_role = "AUDITOR_MEMBER_RETIRED" if is_retired else "AUDITOR_ACTIVE_MEMBER"
+
+        events = self.conn.execute(
+            "SELECT * FROM ledger_events ORDER BY event_id ASC"
+        ).fetchall()
+
+        chain_valid = True
+        broken_at_event_id: int | None = None
+        if hasattr(self, "verify_chain"):
+            chain_res = self.verify_chain()
+            if isinstance(chain_res, dict):
+                chain_valid = bool(chain_res.get("valid", chain_res.get("intact", True)))
+                broken_at_event_id = chain_res.get("broken_at_event_id")
+            else:
+                chain_valid = bool(chain_res)
+
+        expected_prev_hash = "GENESIS_" + ("0" * 56)
+        head_hash = expected_prev_hash
+        recomputed_bucket_deltas: Dict[str, int] = {}
+
+        for idx, ev in enumerate(events):
+            ev_dict = dict(ev)
+            prev_hash = ev_dict.get("prev_hash", "")
+            stored_hash = ev_dict.get("event_hash", "")
+            if idx == 0 and prev_hash not in (expected_prev_hash, "GENESIS"):
+                chain_valid = False
+                broken_at_event_id = int(ev_dict.get("event_id", 0))
+            elif idx > 0 and prev_hash != expected_prev_hash:
+                chain_valid = False
+                broken_at_event_id = int(ev_dict.get("event_id", 0))
+            if stored_hash:
+                expected_prev_hash = stored_hash
+                head_hash = stored_hash
+
+            b_code = ev_dict.get("bucket_code")
+            d_cents = int(ev_dict.get("delta_cents") or 0)
+            if b_code:
+                recomputed_bucket_deltas[b_code] = recomputed_bucket_deltas.get(b_code, 0) + d_cents
+
+        buckets_rows = self.conn.execute(
+            "SELECT bucket_code, balance_cents FROM buckets ORDER BY bucket_code ASC"
+        ).fetchall()
+        current_buckets = {r["bucket_code"]: int(r["balance_cents"]) for r in buckets_rows}
+
+        retiree_count = 0
+        if retiree_table:
+            retiree_count = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM retiree_members WHERE status = 'MEMBER_RETIRED'"
+                ).fetchone()["cnt"]
+            )
+
+        mortgage_count = 0
+        mortgages_table = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mortgages'"
+        ).fetchone()
+        if mortgages_table:
+            mortgage_count = int(
+                self.conn.execute("SELECT COUNT(*) AS cnt FROM mortgages").fetchone()["cnt"]
+            )
+
+        iso_status = self.verify_iso12207_compliance() if hasattr(self, "verify_iso12207_compliance") else None
+
+        audit_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "auditor_token": auditor_token,
+                    "auditor_role": auditor_role,
+                    "event_count": len(events),
+                    "head_hash": head_hash,
+                    "current_buckets": current_buckets,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        report = {
+            "rule_code": "AUDIT_01_UNIVERSAL_LEDGER_AUDIT",
+            "auditor_token": auditor_token,
+            "auditor_role": auditor_role,
+            "can_retiree_audit": True,
+            "chain_intact": chain_valid,
+            "broken_at_event_id": broken_at_event_id,
+            "iso12207_compliant": iso_status.get("compliant") if isinstance(iso_status, dict) else None,
+            "event_count": len(events),
+            "head_hash": head_hash,
+            "buckets_balance_cents": current_buckets,
+            "event_bucket_deltas_cents": recomputed_bucket_deltas,
+            "retired_members_count": retiree_count,
+            "mortgages_count": mortgage_count,
+            "audit_receipt_sha256": audit_fingerprint,
+        }
+
+        if record_audit_event and hasattr(self, "_append_event"):
+            self._append_event(
+                rule_code="AUDIT_01_UNIVERSAL_LEDGER_AUDIT",
+                entity_type="MEMBER_AUDIT",
+                entity_id=auditor_token,
+                from_state="LEDGER_STATE",
+                to_state="AUDIT_VERIFIED" if chain_valid else "AUDIT_CHAIN_BROKEN",
+                bucket_code=None,
+                delta_cents=0,
+                payload=report,
+            )
+
+        return report
+    CoopBankLedger.audit_ledger_as_member = audit_ledger_as_member
+
+    def evaluate_evidence_completeness(
+        self: CoopBankLedger,
+        case_id: str,
+        member_token: str,
+        identified_witnesses: int,
+        verified_witness_statements: int,
+        member_rebuttal_recorded: bool,
+        defense_reconciled: bool,
+        employer_documents_only: bool = False,
+        min_completeness_threshold: float = 0.75,
+    ) -> Dict[str, Any]:
+        assert member_token.startswith("[Member_"), f"Invalid member token: {member_token}"
+        if identified_witnesses < 0 or verified_witness_statements < 0:
+            raise ValueError("Witness counts must be non-negative")
+        if verified_witness_statements > identified_witnesses:
+            raise ValueError("Verified witness statements cannot exceed identified witnesses")
+        if not (0.0 <= float(min_completeness_threshold) <= 1.0):
+            raise ValueError("min_completeness_threshold must be between 0.0 and 1.0")
+
+        if identified_witnesses > 0:
+            witness_ratio = round(verified_witness_statements / identified_witnesses, 6)
+            witness_gap = verified_witness_statements < identified_witnesses
+        else:
+            witness_ratio = 1.0
+            witness_gap = False
+
+        rebuttal_gap = not bool(member_rebuttal_recorded)
+        reconciliation_gap = not bool(defense_reconciled)
+        employer_only_gap = bool(employer_documents_only and (witness_gap or rebuttal_gap))
+
+        raw_score = (
+            0.40 * witness_ratio
+            + 0.35 * (1.0 if member_rebuttal_recorded else 0.0)
+            + 0.25 * (1.0 if defense_reconciled else 0.0)
+        )
+        if employer_only_gap:
+            raw_score = min(raw_score, 0.40)
+        completeness_score = round(raw_score, 6)
+
+        has_deficit = (
+            completeness_score < float(min_completeness_threshold)
+            or witness_gap
+            or rebuttal_gap
+            or employer_only_gap
+        )
+        verdict = "EVIDENCE_COMPLETE" if not has_deficit else "ADVOCACY_EVIDENCE_DEFICIT"
+
+        flags: list[str] = []
+        if witness_gap:
+            flags.append("WITNESS_VERIFICATION_INCOMPLETE")
+        if rebuttal_gap:
+            flags.append("MEMBER_REBUTTAL_MISSING")
+        if reconciliation_gap:
+            flags.append("DEFENSE_SUMMARY_UNRECONCILED")
+        if employer_only_gap:
+            flags.append("EMPLOYER_RECORD_UNCORROBORATED")
+        if not flags:
+            flags.append("FULL_WITNESS_AND_REBUTTAL_RECORDED")
+
+        payload = {
+            "case_id": case_id,
+            "member_token": member_token,
+            "verdict": verdict,
+            "completeness_score": completeness_score,
+            "min_completeness_threshold": float(min_completeness_threshold),
+            "identified_witnesses": int(identified_witnesses),
+            "verified_witness_statements": int(verified_witness_statements),
+            "witness_verified_ratio": witness_ratio,
+            "member_rebuttal_recorded": bool(member_rebuttal_recorded),
+            "defense_reconciled": bool(defense_reconciled),
+            "employer_documents_only": bool(employer_documents_only),
+            "flags": flags,
+        }
+
+        if hasattr(self, "_append_event"):
+            prev_row = self.conn.execute(
+                """
+                SELECT to_state FROM ledger_events
+                WHERE rule_code = 'ADVOCACY_01_EVIDENCE_COMPLETENESS' AND entity_id = ?
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                (case_id,),
+            ).fetchone()
+            from_state = prev_row["to_state"] if prev_row and prev_row["to_state"] else "UNREVIEWED"
+            self._append_event(
+                rule_code="ADVOCACY_01_EVIDENCE_COMPLETENESS",
+                entity_type="GRIEVANCE_CASE",
+                entity_id=case_id,
+                from_state=from_state,
+                to_state=verdict,
+                bucket_code=None,
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger.evaluate_evidence_completeness = evaluate_evidence_completeness
+
+
+_attach_mortgage_strike_deferral_rule()
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["reject", "cap"], default="cap")

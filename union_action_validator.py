@@ -151,10 +151,15 @@ def run_union_demo():
     action_id = log_union_action(
         worker_id=worker,
         union_body="[Union_Local_A]",
-        related_action_ref="DISMISSAL_2026_03_01",
-        action_status="DELAYED",
+        related_action_ref="DISMISSAL_2021_05_12",
+        action_status="DISMISSED",
         days_elapsed=21,
-        notes="Sanitized union response log; delayed follow-up past initial window",
+        notes=(
+            "Sanitized [Worker_002] / [Union_Local_A]: dismissed 2021-05-12; union grievance dismissed 2021; "
+            "ALRB DFR filed 2021 and dismissed 2024-06-30. Relied on employer material without independent "
+            "investigation or witness check; claimed language/communication barrier; disputed in-person "
+            "grievance review board defense narrative."
+        ),
     )
     print(f"[+] Logged union action #{action_id} for {worker}")
 

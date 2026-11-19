@@ -222,15 +222,67 @@ def run_sanitized_demo():
     cur.execute("DELETE FROM hardship_and_requests WHERE worker_id = ?", (worker,))
     cur.execute("DELETE FROM disciplinary_actions WHERE worker_id = ?", (worker,))
 
+    if worker == "[Worker_002]":
+        complaints_rows = [
+            (
+                "2021-03-01",
+                worker,
+                "Procedural & Workplace Conduct Dispute",
+                "Sanitized pre-dismissal complaint [Worker_002]: contested PPE, key-return, and break allegations plus communication/representation concerns prior to 2021-05-12 dismissal; unresolved",
+                "UNRESOLVED",
+                None,
+            ),
+        ]
+        hardship_rows = [
+            (
+                "2021-04-15",
+                worker,
+                "COMMUNICATION_AND_RECORD_DISPUTE",
+                "Sanitized record [Worker_002]: requested fair witness verification and clear communication review prior to dismissal; refused",
+                "REFUSED",
+            ),
+        ]
+        disciplinary_rows = [
+            (
+                "2021-05-12",
+                worker,
+                "DISMISSAL",
+                "Contested dismissal (2021-05-12): disputed PPE protocol, key-return, and 15-minute break allegations without independent witness verification",
+                "COMMON_DAILY",
+                0,
+                "2021-05-12T09:00:00+00:00",
+                "2021-05-12T09:00:00+00:00",
+                1,
+            ),
+        ]
+    else:
+        complaints_rows = [
+            ("2026-01-10", worker, "Workplace Harassment", "First sanitized complaint logged; unresolved", "UNRESOLVED", None),
+        ]
+        hardship_rows = [
+            ("2026-02-12", worker, "SECURITY_DISRUPTION", "Sanitized external security/housing disruption; request refused", "REFUSED"),
+        ]
+        disciplinary_rows = [
+            (
+                "2026-03-01",
+                worker,
+                "DISMISSAL",
+                "Cited attendance and cumulative workplace infractions",
+                "COMMON_DAILY",
+                0,
+                "2026-03-01T09:00:00+00:00",
+                "2026-03-01T09:00:00+00:00",
+                1,
+            ),
+        ]
+
     # 1. Worker complaints (filed_at, worker_id, complaint_category, summary, status, resolved_at)
     cur.executemany(
         """
         INSERT INTO worker_complaints (filed_at, worker_id, complaint_category, summary, status, resolved_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        [
-            ("2026-01-10", worker, "Workplace Harassment", "First sanitized complaint logged; unresolved", "UNRESOLVED", None),
-        ],
+        complaints_rows,
     )
 
     # 2. Hardship & requests (recorded_at, worker_id, event_type, description, request_status)
@@ -239,9 +291,7 @@ def run_sanitized_demo():
         INSERT INTO hardship_and_requests (recorded_at, worker_id, event_type, description, request_status)
         VALUES (?, ?, ?, ?, ?)
         """,
-        [
-            ("2026-02-12", worker, "SECURITY_DISRUPTION", "Sanitized external security/housing disruption; request refused", "REFUSED"),
-        ],
+        hardship_rows,
     )
 
     # 3. Disciplinary actions
@@ -254,19 +304,7 @@ def run_sanitized_demo():
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [
-            (
-                "2026-03-01",
-                worker,
-                "DISMISSAL",
-                "Cited attendance and cumulative workplace infractions",
-                "COMMON_DAILY",
-                0,
-                "2026-03-01T09:00:00+00:00",
-                "2026-03-01T09:00:00+00:00",
-                1,
-            ),
-        ],
+        disciplinary_rows,
     )
 
     conn.commit()

@@ -14,3 +14,6 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+exports/
+workers_advocate_audit_bundle.json
+audit_compliance_report.json

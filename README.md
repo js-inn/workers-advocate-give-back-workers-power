@@ -1,12 +1,13 @@
 # Workers Advocate: Give Back Workers' Power
 
-A local-first, zero-dependency Python and SQLite cryptographic auditing engine designed to dismantle the illusion of union protection, track institutional and administrative delays (such as protracted Duty of Fair Representation board backlogs), and restore financial and legal sovereignty to individual workers.
+Local-first, zero-third-party-cloud audit and verification pipeline for workplace inconsistency flags, union representation timeliness, Duty of Fair Representation (DFR) criteria, and Alberta Labour Relations Board (ALRB) procedural checks using deterministic **SHA-256** hashes and anonymized tokens (`[Worker_002]`, `[Union_Local_A]`).
 
-## Core Principles
-* **Individual Sovereignty:** Workers retain absolute control over their data, grievance histories, and legal timelines via local-first SQLite ledgers (`core_audit.db`).
-* **Cryptographic Provenance:** Every grievance and institutional stage transition is secured using sequential SHA-256 hashing to ensure tamper-proof non-repudiation.
-* **Demolishing Fabricated Fear:** Replacing opaque union discretion and bureaucratic gatekeeping with transparent, verifiable compliance reports ready for community legal review.
+## Modules
 
-## Architecture
-* **Local-First Execution:** Runs entirely on mobile/local hardware via Python standard libraries (`sqlite3`, `hashlib`, `json`, `datetime`), removing dependency on third-party cloud infrastructure.
-* **Immutable Audit Trail:** Generates verifiable JSON compliance reports (`audit_compliance_report.json`) for independent legal consultation.
+- `workplace_inconsistency_scanner.py`: Evaluates complaints, hardship/requests, and disciplinary records against `RULE_01`–`RULE_04` with SHA-256 hashes in `core_audit_sanitized.db`.
+- `union_action_validator.py`: Tracks union actions, `days_elapsed`, and validation flags with SHA-256 hashes.
+- `dfr_fairness_validator.py`: Evaluates `DFR_01`–`DFR_03` rules against union actions and high/critical flag counts.
+- `alrb_dfr_simulation.py`: Runs ALRB scenario checks (`Case_A`, `Case_B`, `Case_C`) in `alrb_dfr_sim.db` with simulation hashes.
+- `export_combined_audit_bundle.py`: Exports a worker-scoped JSON bundle (`--worker-id`, `--output`) sealed with `bundle_sha256`.
+- `audit_worker_readonly.py`: Inspects database rows and hashes in read-only mode (`?mode=ro`).
+- `cohort_audit_runner.py`: Runs read-only checks and exports verified per-worker JSON bundles into `exports/`.

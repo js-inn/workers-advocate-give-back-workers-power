@@ -545,6 +545,178 @@ def _attach_iso12207_check() -> None:
 _attach_iso12207_check()
 
 
+def _attach_strike_necessity_gate() -> None:
+    def evaluate_strike_necessity(
+        self: CoopBankLedger,
+        unit_id: str,
+        total_disciplinary_signings: int,
+        invalid_disciplinary_signings: int,
+        total_grievances: int,
+        unresolved_grievances: int,
+        contract_expired: bool,
+        mediation_exhausted: bool,
+        real_wage_gap_pct: float,
+        min_strike_runway_cents: int,
+        employer_operating_margin_pct: float = 0.08,
+        total_safety_checks: int = 100,
+        unresolved_safety_hazards: int = 0,
+        breach_threshold: float = 0.15,
+        grievance_threshold: float = 0.10,
+        wage_gap_threshold: float = 0.03,
+        healthy_margin_threshold: float = 0.10,
+        strained_margin_threshold: float = 0.03,
+        safety_deficit_threshold: float = 0.10,
+        max_strained_wage_demand_pct: float = 0.04,
+    ) -> Dict[str, Any]:
+        if total_disciplinary_signings < 0 or invalid_disciplinary_signings < 0:
+            raise ValueError("Disciplinary signing counts must be non-negative")
+        if invalid_disciplinary_signings > total_disciplinary_signings:
+            raise ValueError("Invalid signings cannot exceed total signings")
+        if total_grievances < 0 or unresolved_grievances < 0 or unresolved_grievances > total_grievances:
+            raise ValueError("Invalid grievance counts")
+        if total_safety_checks < 0 or unresolved_safety_hazards < 0 or unresolved_safety_hazards > total_safety_checks:
+            raise ValueError("Invalid safety check/hazard counts")
+
+        proc_breach_rate = (
+            round(invalid_disciplinary_signings / total_disciplinary_signings, 6)
+            if total_disciplinary_signings > 0
+            else 0.0
+        )
+        unresolved_rate = (
+            round(unresolved_grievances / total_grievances, 6)
+            if total_grievances > 0
+            else 0.0
+        )
+        safety_deficit_rate = (
+            round(unresolved_safety_hazards / total_safety_checks, 6)
+            if total_safety_checks > 0
+            else 0.0
+        )
+
+        margin_pct = round(float(employer_operating_margin_pct), 6)
+        wage_gap = round(float(real_wage_gap_pct), 6)
+
+        high_margin = margin_pct >= healthy_margin_threshold
+        low_margin = margin_pct < strained_margin_threshold
+        safety_or_fairness_deficit = (safety_deficit_rate > safety_deficit_threshold) or (
+            proc_breach_rate > breach_threshold
+        )
+
+        profit_over_safety = bool(high_margin and safety_or_fairness_deficit)
+        low_margin_over_demand = bool(low_margin and (wage_gap > max_strained_wage_demand_pct))
+
+        if profit_over_safety and low_margin_over_demand:
+            balance_flag = "CONFLICTED_EXTREME"
+        elif profit_over_safety:
+            balance_flag = "PROFIT_OVER_SAFETY"
+        elif low_margin_over_demand:
+            balance_flag = "LOW_MARGIN_OVER_DEMAND"
+        else:
+            balance_flag = "BALANCED_EQUILIBRIUM"
+
+        buckets = {
+            r["bucket_code"]: int(r["balance_cents"])
+            for r in self.conn.execute("SELECT bucket_code, balance_cents FROM buckets").fetchall()
+        }
+        hardship_cents = buckets.get("BUCKET_HARDSHIP_RESERVE", 0)
+        lending_cents = buckets.get("BUCKET_LENDING_POOL", 0)
+        available_runway_cents = hardship_cents + lending_cents
+
+        proc_breach_triggered = proc_breach_rate > breach_threshold
+        grievance_backlog_triggered = unresolved_rate > grievance_threshold
+        systemic_breach = proc_breach_triggered or grievance_backlog_triggered or (
+            safety_deficit_rate > safety_deficit_threshold
+        )
+        bargaining_impasse = bool(
+            contract_expired and mediation_exhausted and (wage_gap > wage_gap_threshold)
+        )
+        liquidity_ready = available_runway_cents >= int(min_strike_runway_cents)
+
+        if low_margin_over_demand and not profit_over_safety:
+            verdict = "MEDIATION_OVER_DEMAND_CHECK"
+        elif systemic_breach and bargaining_impasse and liquidity_ready:
+            verdict = "STRIKE_NECESSARY"
+        elif systemic_breach and bargaining_impasse and not liquidity_ready:
+            verdict = "STRIKE_DEFERRED_INSUFFICIENT_RESERVE"
+        elif systemic_breach or bargaining_impasse:
+            verdict = "MEDIATION_ALERT"
+        else:
+            verdict = "STRIKE_NOT_NECESSARY"
+
+        payload = {
+            "unit_id": unit_id,
+            "verdict": verdict,
+            "balance_flag": balance_flag,
+            "profit_over_safety": profit_over_safety,
+            "low_margin_over_demand": low_margin_over_demand,
+            "employer_operating_margin_pct": margin_pct,
+            "safety_deficit_rate": safety_deficit_rate,
+            "procedural_breach_rate": proc_breach_rate,
+            "unresolved_grievance_rate": unresolved_rate,
+            "bargaining_impasse": bargaining_impasse,
+            "real_wage_gap_pct": wage_gap,
+            "liquidity_ready": liquidity_ready,
+            "available_runway_cents": available_runway_cents,
+            "min_strike_runway_cents": int(min_strike_runway_cents),
+        }
+
+        if hasattr(self, "_append_event"):
+            prev_row = self.conn.execute(
+                """
+                SELECT to_state FROM ledger_events
+                WHERE rule_code = ? AND entity_id = ?
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                ("GOVERNANCE_01_STRIKE_NECESSITY", unit_id),
+            ).fetchone()
+            from_state = prev_row["to_state"] if prev_row and prev_row["to_state"] else "UNASSESSED"
+            self._append_event(
+                rule_code="GOVERNANCE_01_STRIKE_NECESSITY",
+                entity_type="BARGAINING_UNIT",
+                entity_id=unit_id,
+                from_state=from_state,
+                to_state=verdict,
+                bucket_code=None,
+                delta_cents=0,
+                payload=payload,
+            )
+        else:
+            last = self.conn.execute(
+                "SELECT event_id, event_hash FROM ledger_events ORDER BY event_id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = last["event_hash"] if last else "0" * 64
+            occurred_at = datetime.now(timezone.utc).isoformat()
+            payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+            raw = f"{prev_hash}|GOVERNANCE_01_STRIKE_NECESSITY|BARGAINING_UNIT|{unit_id}||0|{payload_json}|{occurred_at}"
+            event_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            self.conn.execute(
+                """
+                INSERT INTO ledger_events (
+                    rule_code, entity_type, entity_id, bucket_code, delta_cents,
+                    payload_json, occurred_at, prev_hash, event_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "GOVERNANCE_01_STRIKE_NECESSITY",
+                    "BARGAINING_UNIT",
+                    unit_id,
+                    None,
+                    0,
+                    payload_json,
+                    occurred_at,
+                    prev_hash,
+                    event_hash,
+                ),
+            )
+            self.conn.commit()
+
+        return payload
+
+    CoopBankLedger.evaluate_strike_necessity = evaluate_strike_necessity
+
+
+_attach_strike_necessity_gate()
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["reject", "cap"], default="cap")

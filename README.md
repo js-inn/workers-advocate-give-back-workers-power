@@ -11,3 +11,7 @@ Local-first, zero-third-party-cloud audit and verification pipeline for workplac
 - `export_combined_audit_bundle.py`: Exports a worker-scoped JSON bundle (`--worker-id`, `--output`) sealed with `bundle_sha256`.
 - `audit_worker_readonly.py`: Inspects database rows and hashes in read-only mode (`?mode=ro`).
 - `cohort_audit_runner.py`: Runs read-only checks and exports verified per-worker JSON bundles into `exports/`.
+
+## License & Attribution
+
+Licensed under the **Creator Attribution and Sublicense License** — see [LICENSE](LICENSE) for first attribution to **Jujita Fermin Stairs / JS innovation8390-1 inc.** and creator sublicense rights.

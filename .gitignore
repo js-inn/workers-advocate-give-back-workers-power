@@ -1,0 +1,4 @@
+
+# Local SQLite databases and exported audit JSON reports
+*.db
+*.json

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+Workers Advocate: Give Back Workers' Power
+Workplace Inconsistency & Due-Process Scanner (Sanitized Core)
+"""
+
+import sqlite3
+import hashlib
+import json
+from datetime import datetime, timezone
+
+DB_NAME = "core_audit_sanitized.db"
+
+
+def init_inconsistency_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS worker_complaints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filed_at TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            complaint_category TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            resolved_at TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS disciplinary_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_date TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            cited_infraction TEXT NOT NULL,
+            workplace_baseline_frequency TEXT NOT NULL,
+            peers_disciplined_for_same INTEGER NOT NULL,
+            observed_at TEXT,
+            notified_worker_at TEXT,
+            notified_at_moment_observed INTEGER NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hardship_and_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            request_status TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inconsistency_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            finding TEXT NOT NULL,
+            evidence_hash TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def _hash_finding(scanned_at, worker_id, rule_id, finding):
+    raw = f"{scanned_at}|{worker_id}|{rule_id}|{finding}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def scan_worker_case(worker_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    flags = []
+    scanned_at = datetime.now(timezone.utc).isoformat()
+
+    cursor.execute("""
+        SELECT id, filed_at, complaint_category, summary, status
+        FROM worker_complaints
+        WHERE worker_id = ?
+        ORDER BY filed_at ASC
+    """, (worker_id,))
+    complaints = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT id, action_date, action_type, cited_infraction,
+               workplace_baseline_frequency, peers_disciplined_for_same,
+               observed_at, notified_worker_at, notified_at_moment_observed
+        FROM disciplinary_actions
+        WHERE worker_id = ?
+        ORDER BY action_date ASC
+    """, (worker_id,))
+    actions = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT id, recorded_at, event_type, description, request_status
+        FROM hardship_and_requests
+        WHERE worker_id = ?
+        ORDER BY recorded_at ASC
+    """, (worker_id,))
+    hardships = cursor.fetchall()
+
+    unresolved_complaints = [c for c in complaints if c[4].upper() in ("OPEN", "UNRESOLVED")]
+    dismissals = [a for a in actions if a[2].upper() == "DISMISSAL"]
+
+    if dismissals and unresolved_complaints:
+        for d in dismissals:
+            d_id, d_date, _, d_reason, _, _, _, _, _ = d
+            prior_unresolved = [
+                f"#{c[0]} ({c[2]} filed {c[1][:10]}: '{c[3]}')"
+                for c in unresolved_complaints if c[1] <= d_date
+            ]
+            if prior_unresolved:
+                finding = (
+                    f"INCONSISTENCY #1 (Retaliation / Procedural Failure): Worker was issued a DISMISSAL "
+                    f"on {d_date[:10]} (cited: '{d_reason}') while {len(prior_unresolved)} prior formal "
+                    f"complaint(s) remained UNRESOLVED by administration: {'; '.join(prior_unresolved)}."
+                )
+                flags.append(("RULE_01_UNRESOLVED_COMPLAINT_DISMISSAL", "CRITICAL", finding))
+
+    for a in actions:
+        a_id, a_date, a_type, infraction, baseline, peer_count, _, _, _ = a
+        if baseline.upper() == "COMMON_DAILY" and peer_count == 0:
+            finding = (
+                f"INCONSISTENCY #2 (Selective Enforcement): {a_type} issued on {a_date[:10]} for "
+                f"'{infraction}', which is documented as a COMMON_DAILY workplace occurrence with "
+                f"{peer_count} peers disciplined for the identical behavior. Indicates targeted discipline."
+            )
+            flags.append(("RULE_02_SELECTIVE_ENFORCEMENT", "HIGH", finding))
+
+    for a in actions:
+        a_id, a_date, a_type, infraction, _, _, obs_at, notif_at, immediate_flag = a
+        if immediate_flag == 0:
+            finding = (
+                f"INCONSISTENCY #3 (Failure of Immediate Notice): {a_type} cites '{infraction}' "
+                f"(observed: {obs_at or 'unspecified'}), but the worker was NOT notified at the moment "
+                f"of observation (notified: {notif_at or 'delayed/retroactive'}). Deprives worker of "
+                f"immediate correction and contemporaneous verification."
+            )
+            flags.append(("RULE_03_DELAYED_OBSERVATION_NOTICE", "HIGH", finding))
+
+    active_hardships = [h for h in hardships if h[4].upper() in ("REFUSED", "UNRESOLVED", "OPEN")]
+    for a in actions:
+        a_id, a_date, a_type, infraction, _, _, _, _, _ = a
+        infraction_l = infraction.lower()
+        is_lateness_or_minor = any(k in infraction_l for k in ("late", "lateness", "tardy", "key"))
+        if a_type.upper() == "DISMISSAL" and is_lateness_or_minor and active_hardships:
+            h_summary = "; ".join(
+                f"#{h[0]} [{h[2]} / {h[4]} on {h[1][:10]}: '{h[3]}']"
+                for h in active_hardships
+            )
+            finding = (
+                f"INCONSISTENCY #4 (Proportionality & Unresolved Hardship): DISMISSAL on {a_date[:10]} "
+                f"cites '{infraction}', which may not establish just cause on its own while external "
+                f"security/housing hardship and refused/unresolved requests were present: {h_summary}."
+            )
+            flags.append(("RULE_04_PROPORTIONALITY_HARDSHIP_CONTEXT", "CRITICAL", finding))
+
+    for rule_id, severity, finding in flags:
+        ev_hash = _hash_finding(scanned_at, worker_id, rule_id, finding)
+        cursor.execute("""
+            INSERT INTO inconsistency_flags (scanned_at, worker_id, rule_id, severity, finding, evidence_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (scanned_at, worker_id, rule_id, severity, finding, ev_hash))
+
+    conn.commit()
+    conn.close()
+    return flags
+
+
+def export_compliance_report(worker_id, output_path="audit_compliance_report.json"):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, scanned_at, rule_id, severity, finding, evidence_hash
+        FROM inconsistency_flags
+        WHERE worker_id = ?
+        ORDER BY id ASC
+    """, (worker_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    report = {
+        "project": "Workers Advocate: Give Back Workers' Power",
+        "worker_id": worker_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_flags": len(rows),
+        "flags": [
+            {
+                "flag_id": r[0],
+                "scanned_at": r[1],
+                "rule_id": r[2],
+                "severity": r[3],
+                "finding": r[4],
+                "evidence_hash": r[5],
+            }
+            for r in rows
+        ],
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(f"[+] Exported {len(rows)} flags to {output_path}")
+
+
+def run_sanitized_demo():
+    init_inconsistency_db()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM worker_complaints")
+    cursor.execute("DELETE FROM disciplinary_actions")
+    cursor.execute("DELETE FROM hardship_and_requests")
+    cursor.execute("DELETE FROM inconsistency_flags")
+
+    worker = "[Worker_001]"
+
+    cursor.execute("""
+        INSERT INTO worker_complaints (filed_at, worker_id, complaint_category, summary, status, resolved_at)
+        VALUES
+        ('2026-01-10T09:00:00+00:00', ?, 'Workplace Harassment', 'First formal harassment complaint submitted to administrator', 'UNRESOLVED', NULL),
+        ('2026-02-04T14:30:00+00:00', ?, 'Workplace Harassment', 'Second formal harassment complaint submitted; no resolution provided', 'UNRESOLVED', NULL)
+    """, (worker, worker))
+
+    cursor.execute("""
+        INSERT INTO hardship_and_requests (recorded_at, worker_id, event_type, description, request_status)
+        VALUES
+        ('2026-02-12T08:00:00+00:00', ?, 'SECURITY_DISRUPTION', 'Damaged/broken entry door following unlawful police entry; replacement application refused', 'REFUSED')
+    """, (worker,))
+
+    cursor.execute("""
+        INSERT INTO disciplinary_actions (
+            action_date, worker_id, action_type, cited_infraction,
+            workplace_baseline_frequency, peers_disciplined_for_same,
+            observed_at, notified_worker_at, notified_at_moment_observed
+        )
+        VALUES
+        ('2026-02-15T16:00:00+00:00', ?, 'DISCIPLINARY_NOTICE', 'Forgot to return workplace key at end of shift', 'COMMON_DAILY', 0, '2026-02-15T15:55:00+00:00', '2026-02-15T16:00:00+00:00', 1),
+        ('2026-02-20T11:00:00+00:00', ?, 'WARNING', 'Observed not wearing PPE', 'OCCASIONAL', 0, '2026-02-18T10:15:00+00:00', '2026-02-20T11:00:00+00:00', 0),
+        ('2026-03-01T15:00:00+00:00', ?, 'DISMISSAL', 'Repeated lateness and cumulative workplace infractions', 'RARE', 0, '2026-03-01T15:00:00+00:00', '2026-03-01T15:00:00+00:00', 1)
+    """, (worker, worker, worker))
+
+    conn.commit()
+    conn.close()
+
+    detected = scan_worker_case(worker)
+    print(f"[+] Scan complete for {worker}. Total Inconsistencies Flagged: {len(detected)}\n")
+    for idx, (rule_id, severity, text) in enumerate(detected, 1):
+        print(f"Flag {idx} [{severity}] - {rule_id}:")
+        print(f"  {text}\n")
+    export_compliance_report(worker)
+
+
+if __name__ == "__main__":
+    run_sanitized_demo()
